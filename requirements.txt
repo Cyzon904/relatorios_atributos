@@ -1,0 +1,14 @@
+streamlit
+requests
+pandas
+plotly
+XlsxWriter
+pymongo
+unidecode
+extra-streamlit-components
+starlette<0.40.0
+google-generativeai
+openpyxl
+Flask
+altair
+python-dotenv
