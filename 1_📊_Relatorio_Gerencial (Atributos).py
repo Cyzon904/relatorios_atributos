@@ -158,6 +158,49 @@ def fetch_conversations(start_date, end_date, team_ids=None, regra_mesclada="Inc
     status_text.empty()
     return conversas
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_company_info(company_id):
+    padrao = {"Empresa": f"ID {company_id}", "Tamanho da Empresa": None}
+    url = f"https://api.intercom.io/companies/{company_id}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            attrs = d.get("custom_attributes") or {}
+            return {
+                "Empresa": d.get("name") or padrao["Empresa"],
+                "Tamanho da Empresa": attrs.get("tamanho_da_empresa"),
+            }
+    except Exception:
+        pass
+    return padrao
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_user_and_company(contact_id):
+    if not contact_id:
+        return "-", "-", None
+    url = f"https://api.intercom.io/contacts/{contact_id}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            email = d.get('email') or "-"
+            empresa, tamanho = "-", None
+            companies = d.get('companies', {}).get('data', [])
+            if companies and companies[0].get('id'):
+                info = get_company_info(companies[0]['id'])
+                empresa, tamanho = info["Empresa"], info["Tamanho da Empresa"]
+            return email, empresa, tamanho
+    except Exception:
+        pass
+    return "-", "-", None
+
+def ordenar_faixas(valores):
+    def chave(v):
+        m = re.search(r"\d+", str(v))
+        return (0, int(m.group())) if m else (1, str(v))
+    return sorted(valores, key=chave)
+
 def process_data(conversas, mapping, admin_map):
     rows = []
     for c in conversas:
@@ -183,6 +226,18 @@ def process_data(conversas, mapping, admin_map):
             origem = "Ativa (Analista)"
         else:
             origem = "Receptiva (Cliente)"
+            
+                # Tenta achar o ID do cliente atrelado à conversa
+        contact_id = None
+        email_user, empresa_user, tamanho_user = "-", "-", None
+
+        if c.get('contacts', {}).get('contacts'):
+            contact_id = c['contacts']['contacts'][0].get('id')
+        elif autor_tipo in ['user', 'lead', 'contact']:
+            contact_id = author.get('id')
+
+        if contact_id:
+            email_user, empresa_user, tamanho_user = get_user_and_company(contact_id)
 
         # NOVA REGRA: Verifica se existe ticket de backoffice atrelado e pega o ID
         tem_ticket = "Não"
@@ -221,6 +276,9 @@ def process_data(conversas, mapping, admin_map):
             "Origem": origem,
             "Estado": estado_pt,
             "Atendente": assignee_name,
+            "E-mail": email_user,        # Nova linha
+            "Empresa": empresa_user,
+            "Tamanho da Empresa": tamanho_user or "Sem informação",     # Nova linha
             "Link": link,
             "Tempo Resposta (seg)": time_reply_sec,
             "Tempo Resolução (seg)": time_close_sec,
@@ -267,9 +325,17 @@ def gerar_excel_multias(df, colunas_selecionadas):
                     resumo.to_excel(writer, index=False, sheet_name=nome_aba)
                 except: pass
 
-        cols_fixas = ["Data", "Estado", "Atendente", "Tempo Resposta", "Tempo Resolução", "CSAT Nota", "CSAT Comentario", "Link"]
+        # --- A LISTA ATUALIZADA COM AS NOVAS COLUNAS ---
+        cols_fixas = [
+            "ID", "Data", "Equipe", "Atendente", "E-mail", "Empresa", "Tamanho da Empresa", 
+            "Estado", "Tempo Resposta", "Tempo Resolução", 
+            "Ticket Backoffice", "ID do Ticket", "CSAT Nota", 
+            "CSAT Comentario", "Link"
+        ]
+        
         cols_finais = cols_fixas + [c for c in colunas_selecionadas if c not in cols_fixas]
         cols_existentes = [c for c in cols_finais if c in df.columns]
+        
         df[cols_existentes].to_excel(writer, index=False, sheet_name='Base Completa')
         writer.sheets['Base Completa'].set_column('A:A', 18) 
     return output.getvalue()
@@ -505,14 +571,16 @@ if 'df_final' in st.session_state:
     if aba_selecionada == "🔀 Cruzamentos":
         qtd_cross = st.slider("Quantidade de itens no Ranking:", 5, 50, 10, key="slider_cross")
 
-        def plot_stack(df_in, x_col, color_col, title, limit=10):
+        def plot_stack(df_in, x_col, color_col, title, limit=10, ordem_cor=None):
             top_n = df_in[x_col].value_counts().head(limit).index.tolist()
             df_filtered = df_in[df_in[x_col].isin(top_n)]
             g = df_filtered.groupby([x_col, color_col]).size().reset_index(name='Qtd')
             g['Total'] = g.groupby(x_col)['Qtd'].transform('sum')
             g['Pct'] = g.apply(lambda x: f"{(x['Qtd']/x['Total']*100):.0f}%", axis=1)
             h_dyn = max(600, len(top_n) * 50) 
-            f = px.bar(g, y=x_col, x='Qtd', color=color_col, text='Pct', orientation='h', title=title, height=h_dyn)
+            f = px.bar(g, y=x_col, x='Qtd', color=color_col, text='Pct', orientation='h',
+               title=title, height=h_dyn,
+               category_orders={color_col: ordem_cor} if ordem_cor else None)
             f.update_layout(yaxis={'categoryorder':'total ascending'})
             return f
 
@@ -576,6 +644,39 @@ if 'df_final' in st.session_state:
                 st.info("Não há conversas no período com a versão do app e pelo menos um motivo preenchido.")
 
         st.divider()
+
+        st.divider()
+        st.subheader("🏢 Cruzamento: Motivos e Tamanho da Empresa")
+        
+        col_tam = "Tamanho da Empresa"
+        if col_tam in df.columns and "Motivo de Contato" in df.columns:
+            df_tam = df.dropna(subset=["Motivo de Contato"])
+            df_tam = df_tam[df_tam[col_tam] != "Sem informação"]
+        
+            if df_tam.empty:
+                st.info("Não há conversas com motivo e tamanho da empresa preenchidos.")
+            else:
+                faixas = ordenar_faixas(df_tam[col_tam].unique())
+        
+                st.plotly_chart(
+                    plot_stack(df_tam, "Motivo de Contato", col_tam,
+                               "5. Tamanho da Empresa por Motivo", qtd_cross, ordem_cor=faixas),
+                    use_container_width=True
+                )
+        
+                # Visão normalizada: % dos contatos de cada faixa que vão para cada motivo
+                top_mot = df_tam["Motivo de Contato"].value_counts().head(qtd_cross).index
+                base = df_tam[df_tam["Motivo de Contato"].isin(top_mot)]
+                tab = pd.crosstab(base["Motivo de Contato"], base[col_tam], normalize="columns") * 100
+                tab = tab.reindex(columns=faixas, fill_value=0)
+        
+                fig_heat = px.imshow(tab, text_auto=".0f", aspect="auto",
+                                     labels=dict(color="% da faixa"),
+                                     title="Peso de cada motivo dentro de cada faixa de tamanho (%)")
+                st.plotly_chart(fig_heat, use_container_width=True)
+        
+                st.caption("Conversas por faixa: " + " | ".join(
+                    f"{f}: {(df_tam[col_tam] == f).sum()}" for f in faixas))
         
         st.subheader("🔍 Investigação de Motivos (1 vs 2)")
         
@@ -856,54 +957,65 @@ if 'df_final' in st.session_state:
     if aba_selecionada == "📋 Dados":
         with st.form("form_filtros_tabela"):
             st.write("🔍 Filtros da Pesquisa")
-            c_eq, c1, c2, c3, c4, c5, c6 = st.columns(7)
-            
+                
+            # Dividindo os filtros em duas linhas para não amontoar
+            c_eq, c1, c2, c3, c4 = st.columns(5)
+            c5, c6, c_emp, c_tam = st.columns(4)
+                
             with c_eq:
                 equipes_unicas = sorted(df["Equipe"].astype(str).unique())
                 sel_equipes = st.multiselect("🏢 Equipe (ID):", equipes_unicas)
-                
+                    
             with c1:
                 agentes_unicos = sorted(df["Atendente"].astype(str).unique())
                 sel_agentes = st.multiselect("👤 Analista:", agentes_unicos)
-                
+                    
             with c2:
                 if "Tipo de Atendimento" in df.columns:
                     tipos_unicos = sorted(df["Tipo de Atendimento"].dropna().astype(str).unique())
                     sel_tipos = st.multiselect("💬 Tipo:", tipos_unicos)
                 else:
                     sel_tipos = []
-                    
+                        
             with c3:
                 opcoes_motivo = set()
                 if "Motivo de Contato" in df.columns:
                     opcoes_motivo.update(df["Motivo de Contato"].dropna().astype(str).unique())
                 if "Motivo 2 (Se houver)" in df.columns:
                     opcoes_motivo.update(df["Motivo 2 (Se houver)"].dropna().astype(str).unique())
-                
+                    
                 if opcoes_motivo:
                     sel_motivos = st.multiselect("🎯 Motivo:", sorted(list(opcoes_motivo)))
                 else:
                     sel_motivos = []
-                    
+                        
             with c4:
                 if "Status do atendimento" in df.columns:
                     status_unicos = sorted(df["Status do atendimento"].dropna().astype(str).unique())
                     sel_status = st.multiselect("🚦 Status:", status_unicos)
                 else:
                     sel_status = []
-
+    
             with c5:
                 sel_tem_ticket = st.multiselect("🎫 Tem Ticket?", ["Sim", "Não"])
-
+    
             with c6:
                 if "Versão do aplicativo" in df.columns:
                     versoes_unicas = sorted(df["Versão do aplicativo"].dropna().astype(str).unique())
                     sel_versao = st.multiselect("📱 Versão:", versoes_unicas)
                 else:
                     sel_versao = []
-
+                        
+            with c_emp:
+                empresas_unicas = sorted(df["Empresa"].astype(str).unique())
+                sel_empresa = st.multiselect("🏢 Empresa:", empresas_unicas)
+                    
+            with c_tam:
+                tamanhos_unicos = sorted(df["Tamanho da Empresa"].astype(str).unique())
+                sel_tamanho = st.multiselect("📏 Tamanho:", tamanhos_unicos)
+    
             aplicar = st.form_submit_button("Aplicar Filtros")
-
+    
         df_view = df.copy()
         
         # Nova regra para aplicar o filtro da equipe
@@ -931,6 +1043,12 @@ if 'df_final' in st.session_state:
         if sel_versao:
             df_view = df_view[df_view["Versão do aplicativo"].isin(sel_versao)]
 
+        if sel_empresa:
+            df_view = df_view[df_view["Empresa"].isin(sel_empresa)]
+            
+        if sel_tamanho:
+            df_view = df_view[df_view["Tamanho da Empresa"].isin(sel_tamanho)]
+
         c_resumo, c_botao = st.columns([4, 1])
         
         with c_resumo:
@@ -940,8 +1058,7 @@ if 'df_final' in st.session_state:
             excel = gerar_excel_multias(df_view, cols_usuario)
             st.download_button("📥 Baixar Excel", data=excel, file_name="relatorio_filtrado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
         
-        # Adiciona as duas colunas novas na exibição da tabela
-        cols_display = ["ID", "Data", "Estado", "Equipe", "Atendente", "Link", "Tempo Resolução", "Ticket Backoffice", "ID do Ticket"] + cols_usuario
+        cols_display = ["ID", "Data", "Estado", "Equipe", "Atendente", "E-mail", "Empresa", "Tamanho da Empresa", "Link", "Tempo Resolução", "Ticket Backoffice", "ID do Ticket"] + cols_usuario
         cols_existentes = [c for c in cols_display if c in df_view.columns]
         
         # Exibe a tabela filtrada
@@ -977,20 +1094,20 @@ if 'df_final' in st.session_state:
                     st.error("Não foi possível ler o histórico dessa conversa. Verifique o ID.")
                 else:
                     prompt = f"""Extraia as 8 informações solicitadas desta conversa de suporte. 
-Não adicione nenhum texto além das respostas.
+    Não adicione nenhum texto além das respostas.
 
-Conversa:
-{texto_ticket}
+    Conversa:
+    {texto_ticket}
 
-Responda EXATAMENTE com este formato, linha por linha:
-* 🎯 **Motivo do contato:** [preencha aqui]
-* 📌 **Quantos problemas relatados:** [preencha aqui]
-* 💭 **Principais dúvidas ou reclamações:** [preencha aqui]
-* 🛠️ **Ação do agente:** [preencha aqui]
-* 📞 **Finalizada por falta de contato?:** [preencha aqui]
-* 🤖 **Potencial para automação por bot?:** [preencha aqui]
-* 🚨 **Nível de criticidade:** [preencha aqui]
-* 💡 **Oportunidade de melhoria:** [preencha aqui]"""
+    Responda EXATAMENTE com este formato, linha por linha:
+    * 🎯 **Motivo do contato:** [preencha aqui]
+    * 📌 **Quantos problemas relatados:** [preencha aqui]
+    * 💭 **Principais dúvidas ou reclamações:** [preencha aqui]
+    * 🛠️ **Ação do agente:** [preencha aqui]
+    * 📞 **Finalizada por falta de contato?:** [preencha aqui]
+    * 🤖 **Potencial para automação por bot?:** [preencha aqui]
+    * 🚨 **Nível de criticidade:** [preencha aqui]
+    * 💡 **Oportunidade de melhoria:** [preencha aqui]"""
 
                     resposta = chamar_gemini_seguro(prompt)
                     
